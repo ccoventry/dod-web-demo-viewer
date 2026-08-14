@@ -1,0 +1,22 @@
+# Game content — Valve-owned. Do not commit to a public repository.
+assets/**/*.zip
+assets/**/*.bsp
+assets/**/*.wad
+assets/**/*.mdl
+assets/**/*.spr
+assets/**/*.wav
+assets/**/*.dem
+assets/**/*.pk3
+
+# Compiled game libraries (build artefacts, and large)
+assets/**/*.wasm
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Local tooling
+node_modules/

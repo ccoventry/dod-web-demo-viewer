@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<title>Day of Defeat 1.3 — Web Demo Viewer</title>
+<meta name="description" content="Standalone browser-based Day of Defeat 1.3 demo playback, powered by Xash3D-FWGS compiled to WebAssembly." />
+
+<!--
+  ============================================================================
+  COOP/COEP SHIM  —  MUST BE THE FIRST SCRIPT ON THE PAGE.
+  ----------------------------------------------------------------------------
+  GitHub Pages cannot send Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy
+  response headers. This service worker re-serves every response with them so that
+  `crossOriginIsolated === true` and SharedArrayBuffer / multi-threaded WASM works.
+
+  It reloads the page exactly once on first visit to take control. That is normal.
+  ============================================================================
+-->
+<script>
+  // Configure the shim BEFORE it loads. See coi-serviceworker.js for the full option list.
+  window.coi = {
+    // `credentialless` lets us keep pulling engine .wasm from jsDelivr without
+    // requiring the CDN to send Cross-Origin-Resource-Policy. Chromium-only;
+    // the shim falls back to `require-corp` elsewhere.
+    coepCredentialless: () => !(window.chrome === undefined || navigator.userAgentData?.brands === undefined),
+    coepDegrades: true,
+    quiet: false,
+    // Bail out instead of reload-looping if the SW cannot take control.
+    doReload: () => window.location.reload(),
+  };
+</script>
+<script src="./coi-serviceworker.js"></script>
+
+<style>
+  :root {
+    --bg:            #0a0b0d;
+    --panel:         #14161a;
+    --panel-border:  #23272e;
+    --text:          #e6e8ec;
+    --text-dim:      #8b929e;
+    --accent:        #c8a45c;   /* DoD brass */
+    --accent-dim:    #6d5a33;
+    --danger:        #e0574a;
+    --font-ui:       ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --font-mono:     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    overscroll-behavior: none;
+  }
+
+  /* ---- Canvas surface -------------------------------------------------- */
+  #viewport {
+    position: fixed;
+    inset: 0;
+    display: block;
+    background: #000;
+  }
+
+  #canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    outline: none;
+    border: 0;
+    /* Keep GoldSrc's chunky texel look crisp when the backbuffer is upscaled. */
+    image-rendering: pixelated;
+    touch-action: none;
+    cursor: default;
+  }
+  #canvas.locked { cursor: none; }
+
+  /* ---- Boot / status overlay ------------------------------------------ */
+  #overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(1200px 700px at 50% 38%, #1a1d23 0%, #0a0b0d 72%);
+    transition: opacity .45s ease, visibility .45s ease;
+  }
+  #overlay[hidden] { display: none; }
+  #overlay.fading { opacity: 0; visibility: hidden; pointer-events: none; }
+
+  .boot {
+    width: min(560px, calc(100vw - 48px));
+    text-align: center;
+    padding: 0 8px;
+  }
+
+  .boot h1 {
+    margin: 0 0 6px;
+    font-size: clamp(20px, 4.4vw, 30px);
+    font-weight: 650;
+    letter-spacing: .10em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .boot .sub {
+    margin: 0 0 30px;
+    font-size: 12px;
+    letter-spacing: .22em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+
+  .bar {
+    position: relative;
+    height: 4px;
+    width: 100%;
+    background: #202429;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .bar > i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 0%;
+    background: linear-gradient(90deg, var(--accent-dim), var(--accent));
+    transition: width .18s linear;
+  }
+  .bar.indeterminate > i {
+    width: 34% !important;
+    animation: slide 1.15s cubic-bezier(.65,.05,.36,1) infinite;
+  }
+  @keyframes slide {
+    0%   { left: -34%; }
+    100% { left: 100%; }
+  }
+
+  #status {
+    margin-top: 14px;
+    min-height: 18px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: .02em;
+  }
+
+  #hint {
+    margin-top: 34px;
+    font-size: 12px;
+    line-height: 1.75;
+    color: #5f6773;
+  }
+  #hint kbd {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    background: #1c1f24;
+    border: 1px solid var(--panel-border);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    padding: 1px 5px;
+    color: var(--text-dim);
+  }
+
+  /* ---- Start gate (browsers require a gesture for audio + pointer lock) - */
+  #startBtn {
+    margin-top: 28px;
+    appearance: none;
+    border: 1px solid var(--accent-dim);
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    padding: 12px 34px;
+    border-radius: 3px;
+    cursor: pointer;
+    transition: background .16s ease, color .16s ease;
+  }
+  #startBtn:hover  { background: var(--accent); color: #0a0b0d; }
+  #startBtn:active { transform: translateY(1px); }
+  #startBtn[hidden] { display: none; }
+
+  /* ---- Error panel ----------------------------------------------------- */
+  #error {
+    width: min(720px, calc(100vw - 48px));
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-left: 3px solid var(--danger);
+    border-radius: 4px;
+    padding: 22px 26px;
+    text-align: left;
+  }
+  #error[hidden] { display: none; }
+  #error h2 {
+    margin: 0 0 10px;
+    font-size: 14px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--danger);
+  }
+  #error pre {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    line-height: 1.65;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 42vh;
+    overflow: auto;
+  }
+
+  /* ---- Dev console (?dev=1) -------------------------------------------- */
+  #log {
+    position: fixed;
+    z-index: 30;
+    left: 0; right: 0; bottom: 0;
+    height: 30vh;
+    margin: 0;
+    padding: 10px 14px;
+    overflow: auto;
+    background: rgba(6, 7, 9, .88);
+    border-top: 1px solid var(--panel-border);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: #9aa3b0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    backdrop-filter: blur(3px);
+  }
+  #log[hidden] { display: none; }
+  #log .err { color: var(--danger); }
+
+  @media (prefers-reduced-motion: reduce) {
+    .bar.indeterminate > i { animation: none; width: 100% !important; }
+    #overlay, .bar > i { transition: none; }
+  }
+</style>
+</head>
+
+<body>
+
+<!-- ======================= RENDER SURFACE ======================= -->
+<div id="viewport">
+  <!-- tabindex makes the canvas focusable so the engine receives key events -->
+  <canvas id="canvas" tabindex="0" aria-label="Day of Defeat demo playback surface"></canvas>
+</div>
+
+<!-- ======================= BOOT OVERLAY ========================= -->
+<div id="overlay">
+  <div class="boot">
+    <h1>Day of Defeat 1.3</h1>
+    <p class="sub">Web Demo Viewer</p>
+
+    <div class="bar indeterminate" id="barWrap" role="progressbar"
+         aria-valuemin="0" aria-valuemax="100" aria-label="Loading progress">
+      <i id="bar"></i>
+    </div>
+
+    <div id="status" role="status" aria-live="polite">Initialising…</div>
+
+    <button id="startBtn" hidden>Play Demo</button>
+
+    <div id="hint">
+      <kbd>Esc</kbd> release cursor &nbsp;·&nbsp;
+      <kbd>~</kbd> console &nbsp;·&nbsp;
+      <kbd>F5</kbd> free-look camera &nbsp;·&nbsp;
+      <kbd>Shift</kbd>+<kbd>F2</kbd> demo timeline
+    </div>
+
+    <div id="error" hidden>
+      <h2>Startup failed</h2>
+      <pre id="errorText"></pre>
+    </div>
+  </div>
+</div>
+
+<!-- ======================= DEV CONSOLE ========================== -->
+<pre id="log" hidden></pre>
+
+
+<script type="module">
+/* ============================================================================
+ *  DoD 1.3 Web Demo Viewer — engine host
+ *
+ *  Engine:  Xash3D-FWGS (GoldSrc reimplementation) compiled with Emscripten,
+ *           consumed as the `xash3d-fwgs` ES module from jsDelivr.
+ *
+ *  Boot order is load-bearing and must not be rearranged:
+ *      1. new Xash3D(...)   – configure, nothing is fetched yet
+ *      2. await init()      – WASM runtime up, Emscripten VFS now exists
+ *      3. mount assets      – write game files into the VFS
+ *      4. main()            – start the frame loop; engine reads the gamedir
+ *
+ *  Writing files before (2) throws (no FS). Writing after (4) is a race — the
+ *  engine has already scanned the gamedir and built its file index.
+ * ==========================================================================*/
+
+import { Xash3D } from 'https://cdn.jsdelivr.net/npm/xash3d-fwgs@1.2.2/+esm';
+
+/* ---------------------------------------------------------------------------
+ * 1. CONFIGURATION
+ * -------------------------------------------------------------------------*/
+
+/** Pinned engine version. Never use @latest in production — the WASM ABI moves. */
+const XASH_VERSION = '1.2.2';
+const CDN = `https://cdn.jsdelivr.net/npm/xash3d-fwgs@${XASH_VERSION}/dist`;
+
+/** Mod directory name passed to `-game`. Also the VFS mount point. */
+// TEMPORARY TEST EDIT (2026-08-13) — see xash-transcode/docs/web_preview_viewer.md
+// step 3. No compiled DoD client/server wasm exists yet, so per this file's own
+// "Testing before you have them" section below, point at Half-Life's published
+// hlsdk-portable build instead and mount our DoD content pack under /valve. This
+// only tests whether Xash's engine can replay the transcoded IDEM demo stream at
+// all (world/players/movement) — expect no DoD HUD. Revert to 'dod' + the DoD
+// wasm paths once a real DoD build exists.
+const GAME_DIR = 'valve';
+
+const CONFIG = {
+  gameDir: GAME_DIR,
+
+  /** Asset pack fetched at boot and unpacked into the VFS. */
+  assetPack: '/assets/dod_custom_pack.zip',
+
+  /** Renderer backend: 'gl4es' | 'gles3compat' (both → WebGL2) | 'soft'. */
+  renderer: 'gl4es',
+
+  /**
+   * DoD game logic, compiled to wasm32 by Emscripten.
+   *
+   * ⚠ The `xash3d-fwgs` package ships the ENGINE only. It does not ship game
+   *   code. The wrapper unconditionally queues these two paths as dynamic
+   *   libraries, so if the files are missing the loader 404s and the engine
+   *   aborts before the first frame.
+   *
+   *   Half-Life's are on npm (`hlsdk-portable`); Day of Defeat's are not —
+   *   dod/cl_dll + dod/dlls have to be built against hlsdk-portable with
+   *   emcmake. Drop the artefacts at these paths once built.
+   */
+  // TEMPORARY TEST EDIT — pinned hlsdk-portable build (assets/README.md's
+  // documented fallback), not the unbuilt DoD paths. Note: the package added
+  // a `valve/` layer under dist/ since the README's snippet was written —
+  // dist/dlls/... 404s, the real path is dist/valve/dlls/....
+  clientLib: 'https://cdn.jsdelivr.net/npm/hlsdk-portable@0.1.3/dist/valve/cl_dlls/client_emscripten_wasm32.wasm',
+  serverLib: 'https://cdn.jsdelivr.net/npm/hlsdk-portable@0.1.3/dist/valve/dlls/hl_emscripten_wasm32.wasm',
+
+  /** Seconds to wait after `main()` before issuing playdemo. */
+  demoBootDelayMs: 1200,
+};
+
+/* ---------------------------------------------------------------------------
+ * 2. URL QUERY STRING WRAPPER
+ *
+ *    ?demo=match.dem     demo to auto-play (.dem optional, subdirs allowed)
+ *    ?map=dod_avalanche  load a map instead of a demo
+ *    ?pack=custom.zip    override the asset pack URL
+ *    ?renderer=soft      force the software rasteriser
+ *    ?dev=1              show the engine console output overlay
+ *    ?autostart=1        skip the click-to-start gate (breaks audio in some
+ *                        browsers, which require a user gesture for AudioContext)
+ * -------------------------------------------------------------------------*/
+
+const Q = new URLSearchParams(location.search);
+
+/**
+ * Sanitise a user-supplied demo name.
+ * `playdemo` resolves relative to the gamedir and appends .dem itself, so we
+ * strip the extension. Path traversal and absolute paths are rejected outright
+ * — the query string is attacker-controllable via a shared link.
+ */
+function parseDemoName(raw) {
+  if (!raw) return null;
+  let name = String(raw).trim().replace(/\\/g, '/');
+  if (!name) return null;
+  if (name.startsWith('/') || name.split('/').includes('..')) return null;
+  if (!/^[A-Za-z0-9._\-/]+$/.test(name)) return null;
+  name = name.replace(/\.dem$/i, '');
+  return name || null;
+}
+
+function parseMapName(raw) {
+  if (!raw) return null;
+  const name = String(raw).trim().replace(/\.bsp$/i, '');
+  return /^[A-Za-z0-9._-]+$/.test(name) ? name : null;
+}
+
+const REQUEST = {
+  demo:     parseDemoName(Q.get('demo')),
+  map:      parseMapName(Q.get('map')),
+  pack:     Q.get('pack') || CONFIG.assetPack,
+  renderer: ['gl4es', 'gles3compat', 'soft'].includes(Q.get('renderer'))
+              ? Q.get('renderer') : CONFIG.renderer,
+  dev:      Q.get('dev') === '1',
+  autostart: Q.get('autostart') === '1',
+};
+
+/* ---------------------------------------------------------------------------
+ * 3. UI PLUMBING
+ * -------------------------------------------------------------------------*/
+
+const els = {
+  canvas:   document.getElementById('canvas'),
+  overlay:  document.getElementById('overlay'),
+  barWrap:  document.getElementById('barWrap'),
+  bar:      document.getElementById('bar'),
+  status:   document.getElementById('status'),
+  hint:     document.getElementById('hint'),
+  startBtn: document.getElementById('startBtn'),
+  error:    document.getElementById('error'),
+  errorText:document.getElementById('errorText'),
+  log:      document.getElementById('log'),
+};
+
+if (REQUEST.dev) els.log.hidden = false;
+
+function setStatus(text) {
+  els.status.textContent = text;
+}
+
+/** progress: 0..1 for determinate, or null for the indeterminate sweep. */
+function setProgress(progress) {
+  if (progress == null) {
+    els.barWrap.classList.add('indeterminate');
+    els.barWrap.removeAttribute('aria-valuenow');
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, Math.round(progress * 100)));
+  els.barWrap.classList.remove('indeterminate');
+  els.bar.style.width = pct + '%';
+  els.barWrap.setAttribute('aria-valuenow', String(pct));
+}
+
+function hideOverlay() {
+  els.overlay.classList.add('fading');
+  setTimeout(() => { els.overlay.hidden = true; }, 500);
+}
+
+function fail(err) {
+  const detail = err && err.stack ? err.stack : String(err);
+  console.error('[viewer]', err);
+  els.overlay.hidden = false;
+  els.overlay.classList.remove('fading');
+  els.barWrap.style.display = 'none';
+  els.startBtn.hidden = true;
+  els.hint.hidden = true;
+  els.error.hidden = false;
+  els.errorText.textContent = detail;
+  setStatus('');
+}
+
+function devLog(line, isErr) {
+  if (!REQUEST.dev) return;
+  const span = document.createElement('span');
+  if (isErr) span.className = 'err';
+  span.textContent = line + '\n';
+  els.log.appendChild(span);
+  // Only autoscroll when already pinned to the bottom.
+  if (els.log.scrollTop + els.log.clientHeight >= els.log.scrollHeight - 40) {
+    els.log.scrollTop = els.log.scrollHeight;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * 4. PATH RESOLUTION
+ *
+ *    On a GitHub Pages *project* site the app is served from
+ *    https://user.github.io/<repo>/ — so a root-absolute '/assets/x.zip'
+ *    resolves to https://user.github.io/assets/x.zip and 404s.
+ *
+ *    We therefore resolve every app-relative URL against document.baseURI,
+ *    treating a leading '/' as "relative to the deployment root", which is
+ *    what people actually mean when they write it.
+ * -------------------------------------------------------------------------*/
+
+function appUrl(path) {
+  if (/^(https?:)?\/\//i.test(path) || path.startsWith('data:') || path.startsWith('blob:')) {
+    return path;
+  }
+  return new URL(path.replace(/^\/+/, './').replace(/^\.\//, ''), document.baseURI).href;
+}
+
+/* ---------------------------------------------------------------------------
+ * 5. ZIP MOUNTING
+ *
+ *    `xash3d-fwgs` exposes the raw Emscripten FS (mkdir / mkdirTree /
+ *    writeFile / chdir / syncfs) and nothing more — there is no archive
+ *    support in the package. We implement a ZIP reader here and graft
+ *    downloadAndExtractZip() onto the instance so the call site reads the way
+ *    you'd expect.
+ *
+ *    Supports stored (method 0) and deflated (method 8) entries, plus ZIP64
+ *    central directories. Decompression uses the native DecompressionStream —
+ *    no JS inflate, no third-party dependency.
+ * -------------------------------------------------------------------------*/
+
+const SIG = {
+  EOCD:        0x06054b50,  // end of central directory
+  ZIP64_LOC:   0x07064b50,  // zip64 EOCD locator
+  ZIP64_EOCD:  0x06064b50,  // zip64 end of central directory
+  CENTRAL:     0x02014b50,  // central directory file header
+};
+
+/** Fetch an ArrayBuffer, reporting download progress where Content-Length allows. */
+async function fetchWithProgress(url, onProgress) {
+  const res = await fetch(url, { credentials: 'same-origin', cache: 'default' });
+  if (!res.ok) {
+    throw new Error(`Failed to download ${url} — HTTP ${res.status} ${res.statusText}`);
+  }
+
+  const total = Number(res.headers.get('Content-Length')) || 0;
+
+  if (!res.body || !total) {
+    onProgress?.(null, 0, 0);
+    return await res.arrayBuffer();
+  }
+
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.byteLength;
+    onProgress?.(received / total, received, total);
+  }
+
+  const out = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.byteLength; }
+  return out.buffer;
+}
+
+/** Locate the End Of Central Directory record by scanning backwards. */
+function findEOCD(view, len) {
+  // EOCD is 22 bytes + up to 64 KiB of trailing comment.
+  const maxScan = Math.min(len, 22 + 0xffff);
+  for (let i = len - 22; i >= len - maxScan; i--) {
+    if (i < 0) break;
+    if (view.getUint32(i, true) === SIG.EOCD) return i;
+  }
+  throw new Error('Not a ZIP archive (no end-of-central-directory record found).');
+}
+
+/** Read the central directory, transparently handling ZIP64. */
+function readCentralDirectory(buf) {
+  const view = new DataView(buf);
+  const len = buf.byteLength;
+  const eocd = findEOCD(view, len);
+
+  let entryCount = view.getUint16(eocd + 10, true);
+  let cdOffset   = view.getUint32(eocd + 16, true);
+
+  // ZIP64: the 32-bit fields are saturated and the real values live elsewhere.
+  if (entryCount === 0xffff || cdOffset === 0xffffffff) {
+    const locator = eocd - 20;
+    if (locator >= 0 && view.getUint32(locator, true) === SIG.ZIP64_LOC) {
+      const z64 = Number(view.getBigUint64(locator + 8, true));
+      if (view.getUint32(z64, true) === SIG.ZIP64_EOCD) {
+        entryCount = Number(view.getBigUint64(z64 + 32, true));
+        cdOffset   = Number(view.getBigUint64(z64 + 48, true));
+      }
+    }
+  }
+
+  const entries = [];
+  let p = cdOffset;
+
+  for (let i = 0; i < entryCount; i++) {
+    if (view.getUint32(p, true) !== SIG.CENTRAL) {
+      throw new Error(`Corrupt ZIP: bad central directory header at entry ${i}.`);
+    }
+
+    const method      = view.getUint16(p + 10, true);
+    let   compSize    = view.getUint32(p + 20, true);
+    let   uncompSize  = view.getUint32(p + 24, true);
+    const nameLen     = view.getUint16(p + 28, true);
+    const extraLen    = view.getUint16(p + 30, true);
+    const commentLen  = view.getUint16(p + 32, true);
+    let   localOffset = view.getUint32(p + 42, true);
+
+    const name = new TextDecoder('utf-8').decode(
+      new Uint8Array(buf, p + 46, nameLen)
+    );
+
+    // Walk the extra field for the ZIP64 extended information block (0x0001).
+    if (compSize === 0xffffffff || uncompSize === 0xffffffff || localOffset === 0xffffffff) {
+      let e = p + 46 + nameLen;
+      const end = e + extraLen;
+      while (e + 4 <= end) {
+        const tag  = view.getUint16(e, true);
+        const size = view.getUint16(e + 2, true);
+        if (tag === 0x0001) {
+          let q = e + 4;
+          if (uncompSize  === 0xffffffff) { uncompSize  = Number(view.getBigUint64(q, true)); q += 8; }
+          if (compSize    === 0xffffffff) { compSize    = Number(view.getBigUint64(q, true)); q += 8; }
+          if (localOffset === 0xffffffff) { localOffset = Number(view.getBigUint64(q, true)); q += 8; }
+          break;
+        }
+        e += 4 + size;
+      }
+    }
+
+    entries.push({ name, method, compSize, uncompSize, localOffset });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+
+  return entries;
+}
+
+/** Compute the byte offset of an entry's payload from its local file header. */
+function localDataOffset(view, localOffset) {
+  // Local header: sig(4) ver(2) flag(2) method(2) time(2) date(2) crc(4)
+  //               csize(4) usize(4) nameLen(2) extraLen(2) = 30 bytes
+  const nameLen  = view.getUint16(localOffset + 26, true);
+  const extraLen = view.getUint16(localOffset + 28, true);
+  return localOffset + 30 + nameLen + extraLen;
+}
+
+/** Inflate a raw deflate stream using the platform codec. */
+async function inflateRaw(bytes) {
+  if (typeof DecompressionStream === 'undefined') {
+    throw new Error(
+      'This browser lacks DecompressionStream. Use a stored (uncompressed) ZIP, ' +
+      'e.g. `zip -0 -r dod_custom_pack.zip .`'
+    );
+  }
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate-raw'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+/**
+ * Normalise an archive path and reject anything that escapes the mount point.
+ * Zip-slip is a real vector here: the pack URL is overridable via ?pack=.
+ */
+function safeJoin(mountPoint, entryName) {
+  const parts = entryName.replace(/\\/g, '/').split('/').filter(
+    (seg) => seg && seg !== '.'
+  );
+  if (parts.some((seg) => seg === '..')) return null;
+  if (!parts.length) return null;
+  return `${mountPoint.replace(/\/+$/, '')}/${parts.join('/')}`;
+}
+
+/**
+ * Download a ZIP and unpack it into the engine's virtual filesystem.
+ *
+ * @param {object} FS          Emscripten filesystem object
+ * @param {string} url         archive URL (app-relative or absolute)
+ * @param {string} mountPoint  VFS directory to extract into, e.g. '/dod'
+ * @param {(phase:string, progress:number|null, detail:string)=>void} [onProgress]
+ * @returns {Promise<{files:number, bytes:number}>}
+ */
+async function downloadAndExtractZip(FS, url, mountPoint, onProgress) {
+  const resolved = appUrl(url);
+
+  onProgress?.('download', null, resolved);
+  const buf = await fetchWithProgress(resolved, (p, received, total) => {
+    onProgress?.('download', p, total ? `${fmtBytes(received)} / ${fmtBytes(total)}` : '');
+  });
+
+  onProgress?.('extract', 0, '');
+  const view = new DataView(buf);
+  const entries = readCentralDirectory(buf);
+
+  FS.mkdirTree(mountPoint);
+
+  const seenDirs = new Set([mountPoint]);
+  let written = 0;
+  let bytes = 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+
+    // Directory entries carry no payload; the mkdirTree below covers them.
+    if (entry.name.endsWith('/')) continue;
+
+    const target = safeJoin(mountPoint, entry.name);
+    if (!target) {
+      console.warn('[viewer] skipping unsafe archive path:', entry.name);
+      continue;
+    }
+
+    const dir = target.slice(0, target.lastIndexOf('/'));
+    if (dir && !seenDirs.has(dir)) {
+      FS.mkdirTree(dir);
+      seenDirs.add(dir);
+    }
+
+    const start = localDataOffset(view, entry.localOffset);
+    const raw = new Uint8Array(buf, start, entry.compSize);
+
+    let data;
+    if (entry.method === 0) {
+      data = raw;
+    } else if (entry.method === 8) {
+      data = await inflateRaw(raw);
+    } else {
+      console.warn(`[viewer] unsupported compression method ${entry.method} for ${entry.name}`);
+      continue;
+    }
+
+    FS.writeFile(target, data);
+    written++;
+    bytes += data.byteLength;
+
+    // Yield to the event loop periodically so the progress bar can paint.
+    if ((i & 31) === 0) {
+      onProgress?.('extract', (i + 1) / entries.length, entry.name);
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+
+  onProgress?.('extract', 1, '');
+  return { files: written, bytes };
+}
+
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+  return `${(n / Math.pow(1024, i)).toFixed(i ? 1 : 0)} ${units[i]}`;
+}
+
+/* ---------------------------------------------------------------------------
+ * 6. CANVAS SIZING
+ *
+ *    The engine reads canvas.width/height (the backbuffer), not the CSS box.
+ *    We size the backbuffer to the real device pixels, capped at 2x, because
+ *    a GoldSrc-era software-ish pipeline at 3x DPR on a 4K panel is pure waste.
+ * -------------------------------------------------------------------------*/
+
+function resizeCanvas() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(320, Math.floor(window.innerWidth  * dpr));
+  const h = Math.max(240, Math.floor(window.innerHeight * dpr));
+  if (els.canvas.width !== w || els.canvas.height !== h) {
+    els.canvas.width = w;
+    els.canvas.height = h;
+  }
+}
+
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas, { passive: true });
+window.addEventListener('orientationchange', resizeCanvas, { passive: true });
+
+// Stop the browser from stealing engine keybinds while the canvas has focus.
+window.addEventListener('keydown', (e) => {
+  if (document.activeElement !== els.canvas) return;
+  if (['Tab', 'F5', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)
+      && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+  }
+}, { capture: true });
+
+document.addEventListener('pointerlockchange', () => {
+  els.canvas.classList.toggle('locked', document.pointerLockElement === els.canvas);
+});
+
+/* ---------------------------------------------------------------------------
+ * 7. ENGINE BOOT
+ * -------------------------------------------------------------------------*/
+
+/**
+ * Engine arguments.
+ *
+ * `-game dod`  selects the mod directory.
+ * `-nomouse`   requested for demo playback; harmless if the build ignores it.
+ *              Belt-and-braces: we also set `m_ignore 1` post-boot below.
+ * `+playdemo`  GoldSrc queues `+` commands after engine init, which is the
+ *              cleanest way to autostart without racing the console.
+ */
+function buildArgs() {
+  const args = ['-game', CONFIG.gameDir, '-nomouse'];
+
+  // TEMPORARY TEST EDIT — tie the real engine console to the same ?dev=1
+  // flag that shows the page-level dev log panel, so it's on automatically
+  // on every reload instead of needing "Enable developer console" reset by
+  // hand each time (the engine doesn't persist that setting across a fresh
+  // VFS mount, since it's stored in a config file our pack doesn't carry).
+  if (REQUEST.dev) {
+    args.push('-console', '-dev', '2');
+  }
+
+  if (REQUEST.demo) {
+    args.push('+playdemo', REQUEST.demo);
+  } else if (REQUEST.map) {
+    args.push('+map', REQUEST.map);
+  }
+
+  return args;
+}
+
+const xash = new Xash3D({
+  canvas: els.canvas,
+  renderer: REQUEST.renderer,
+  arguments: buildArgs(),
+
+  /**
+   * Game logic libraries. The wrapper always queues cl_dlls/client_*.wasm and
+   * dlls/hl_*.wasm as dynamic libraries; these overrides repoint them at the
+   * DoD builds. Remove/replace if you are shipping stock Half-Life.
+   */
+  libraries: {
+    client: appUrl(CONFIG.clientLib),
+    server: appUrl(CONFIG.serverLib),
+  },
+
+  /**
+   * CRITICAL for CDN hosting.
+   *
+   * The wrapper's locateFile() is `filesMap[path] ?? path` — it does NOT fall
+   * back to the module's own origin. Any unmapped .wasm therefore resolves
+   * against the *page* URL and 404s on GitHub Pages. Every engine binary must
+   * be mapped explicitly.
+   */
+  filesMap: {
+    'xash.wasm':               `${CDN}/xash.wasm`,
+    'filesystem_stdio.wasm':   `${CDN}/filesystem_stdio.wasm`,
+    'libref_webgl2.wasm':      `${CDN}/libref_webgl2.wasm`,
+    'libref_soft.wasm':        `${CDN}/libref_soft.wasm`,
+    'cl_dlls/menu_emscripten_wasm32.wasm': `${CDN}/libmenu.wasm`,
+  },
+
+  module: {
+    print:    (line) => { devLog(line, false); },
+    printErr: (line) => { devLog(line, true); },
+  },
+});
+
+// Expose for console poking: xash.Cmd_ExecuteString('timedemo foo')
+window.xash = xash;
+
+async function boot() {
+  try {
+    if (!('DecompressionStream' in window)) {
+      devLog('[viewer] DecompressionStream unavailable — stored ZIPs only.', true);
+    }
+    if (!self.crossOriginIsolated) {
+      devLog('[viewer] Not cross-origin isolated. SharedArrayBuffer is unavailable; '
+           + 'check that coi-serviceworker.js registered.', true);
+    }
+
+    /* --- Step 1+2: bring up the WASM runtime -------------------------- */
+    setStatus('Starting engine runtime…');
+    setProgress(null);
+    console.log('[TEST] before xash.init()');
+    await xash.init();
+    console.log('[TEST] after xash.init() — init succeeded');
+
+    if (!xash.em || !xash.em.FS) {
+      throw new Error('Engine initialised but exposed no filesystem.');
+    }
+
+    /* --- Graft the archive helper onto the instance -------------------
+       Object.create keeps the real Emscripten FS as the prototype, so
+       mkdir/writeFile/chdir/syncfs all still work and we mutate nothing. */
+    xash.FS = Object.create(xash.em.FS);
+    xash.FS.downloadAndExtractZip = (url, mountPoint) =>
+      downloadAndExtractZip(xash.em.FS, url, mountPoint, (phase, p, detail) => {
+        setProgress(p);
+        setStatus(
+          phase === 'download'
+            ? `Downloading assets… ${detail || ''}`
+            : `Unpacking assets… ${detail ? detail.split('/').pop() : ''}`
+        );
+      });
+
+    /* --- Step 3: mount the asset pack --------------------------------- */
+    setStatus('Downloading assets…');
+    console.log('[TEST] before downloadAndExtractZip');
+    const result = await xash.FS.downloadAndExtractZip(REQUEST.pack, `/${CONFIG.gameDir}`);
+    console.log('[TEST] after downloadAndExtractZip — mounted', result.files, 'files');
+    devLog(`[viewer] mounted ${result.files} files (${fmtBytes(result.bytes)}) → /${CONFIG.gameDir}`);
+
+    if (result.files === 0) {
+      throw new Error(`Asset pack "${REQUEST.pack}" contained no usable files.`);
+    }
+
+    /* --- Step 4: hand control to the user ----------------------------- */
+    setProgress(1);
+    setStatus(REQUEST.demo ? `Ready — ${REQUEST.demo}.dem` : 'Ready');
+
+    if (REQUEST.autostart) {
+      start();
+    } else {
+      // A user gesture is required before AudioContext and pointer lock will
+      // engage, so we gate the frame loop behind an explicit click.
+      els.startBtn.hidden = false;
+      els.startBtn.textContent = REQUEST.demo ? 'Play Demo' : 'Launch';
+      els.startBtn.addEventListener('click', start, { once: true });
+    }
+  } catch (err) {
+    fail(err);
+  }
+}
+
+function start() {
+  try {
+    els.startBtn.hidden = true;
+    setStatus('Launching…');
+
+    console.log('[TEST] before xash.main()');
+    xash.main();
+    console.log('[TEST] after xash.main() — main() returned');
+
+    hideOverlay();
+    els.canvas.focus();
+
+    // Post-boot console tuning. Deferred because Cmd_ExecuteString needs a
+    // live engine, and `+` args have not necessarily flushed yet.
+    setTimeout(() => {
+      if (xash.exited) return;
+
+      // Reinforce -nomouse for demo playback.
+      xash.Cmd_ExecuteString('m_ignore 1');
+
+      // If the `+playdemo` argument was swallowed (some builds drop `+` args
+      // when a mod gamedir is set), issue it directly as a fallback. Replaying
+      // an already-playing demo is a no-op restart, not a crash.
+      if (REQUEST.demo) {
+        xash.Cmd_ExecuteString(`playdemo ${REQUEST.demo}`);
+      } else if (REQUEST.map) {
+        xash.Cmd_ExecuteString(`map ${REQUEST.map}`);
+      }
+    }, CONFIG.demoBootDelayMs);
+  } catch (err) {
+    fail(err);
+  }
+}
+
+window.addEventListener('error', (e) => {
+  if (els.overlay.hidden) return;   // engine already running; don't hijack
+  fail(e.error || e.message);
+});
+
+boot();
+</script>
+
+</body>
+</html>
