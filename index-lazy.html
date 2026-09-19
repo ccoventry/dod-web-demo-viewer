@@ -304,7 +304,14 @@ document.addEventListener('pointerlockchange', () => {
 });
 
 function buildArgs() {
-  const args = ['-game', CONFIG.gameDir, '-nomouse'];
+  // cl_allow_download 0: a resource the demo precached but the mounted
+  // content lacks must degrade to a "missing during demo playback" warning,
+  // not an HTTP fetch from the recording server's sv_downloadurl. That
+  // fetch can never succeed in this build (DNS needs a thread; SDL reports
+  // "Threads are not supported on this platform") and the engine retries it
+  // forever -- signon never completes and nothing ever renders. Hit for real
+  // with one missing custom map-decoration .mdl.
+  const args = ['-game', CONFIG.gameDir, '-nomouse', '+cl_allow_download', '0'];
   if (REQUEST.dev) args.push('-console', '-dev', '2');
   if (REQUEST.demo) args.push('+playdemo', REQUEST.demo);
   else if (REQUEST.map) args.push('+map', REQUEST.map);
