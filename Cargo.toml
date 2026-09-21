@@ -1,0 +1,7 @@
+# Root of a small 2-crate workspace, migrated here from dod-tools (see
+# docs/web_preview_viewer.md) so this repo's browser-preview transcoder has
+# somewhere to build. `dem-patch/` is a hand-synced second copy of dod-tools'
+# own vendored `dem` fork -- see that crate's own Cargo.toml for why.
+[workspace]
+resolver = "2"
+members = ["dem-patch", "xash-transcode"]
