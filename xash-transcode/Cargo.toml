@@ -1,0 +1,15 @@
+[package]
+name = "xash-transcode"
+version = "0.1.0"
+edition = "2021"
+description = "Transcode GoldSrc HLDEMO demos into the Xash3D IDEM container, with clip cutting"
+
+[dependencies]
+dem = { path = "../dem-patch" }
+eyre = "0.6.12"
+# Only used by the `pack` subcommand (binary side); the library stays dep-light
+# and wasm-clean.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = 3

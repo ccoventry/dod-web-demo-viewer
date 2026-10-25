@@ -20,3 +20,6 @@ Thumbs.db
 
 # Local tooling
 node_modules/
+
+# Rust workspace (xash-transcode/, dem-patch/)
+/target
